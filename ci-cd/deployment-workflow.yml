@@ -1,0 +1,272 @@
+```yaml
+name: PerfectCode Deployment Pipeline
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  NODE_VERSION: '18'
+  CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+  CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+jobs:
+  validate-10kb:
+    name: "Validate 10kb Constraints"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Validate Worker Sizes
+        run: |
+          echo "Validating Cloudflare Worker sizes..."
+          for worker in cloudflare-workers/*.ts; do
+            # Build worker
+            npm run build:worker $(basename "$worker" .ts)
+            
+            # Check size
+            built_file="dist/$(basename "$worker" .ts).js"
+            size=$(wc -c < "$built_file")
+            
+            if [ $size -gt 10240 ]; then
+              echo "❌ Error: $worker is $size bytes (exceeds 10kb limit)"
+              exit 1
+            fi
+            
+            echo "✅ $worker: $size bytes (within 10kb limit)"
+          done
+      
+      - name: Validate Micro-Service Sizes
+        run: |
+          echo "Validating micro-service bundle sizes..."
+          npm run build:microservices
+          
+          for service in dist/microservices/*.js; do
+            size=$(wc -c < "$service")
+            if [ $size -gt 10485760 ]; then # 10MB limit for microservices
+              echo "❌ Warning: $(basename "$service") is $size bytes"
+            else
+              echo "✅ $(basename "$service"): $size bytes"
+            fi
+          done
+
+  test-suite:
+    name: "Comprehensive Testing"
+    runs-on: ubuntu-latest
+    needs: validate-10kb
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Run Unit Tests
+        run: npm run test:unit
+      
+      - name: Run Integration Tests
+        run: npm run test:integration
+      
+      - name: Run Error Handling Tests
+        run: npm run test:error-handling
+      
+      - name: Run Performance Tests
+        run: npm run test:performance
+      
+      - name: Generate Coverage Report
+        run: npm run test:coverage
+      
+      - name: Upload Coverage
+        uses: codecov/codecov-action@v3
+        with:
+          file: ./coverage/lcov.info
+
+  security-scan:
+    name: "Security & Compliance Scan"
+    runs-on: ubuntu-latest
+    needs: test-suite
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Run Security Audit
+        run: npm audit --audit-level high
+      
+      - name: Run SAST Scan
+        uses: github/super-linter@v4
+        env:
+          DEFAULT_BRANCH: main
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Run Container Security Scan
+        uses: aquasec/trivy-action@master
+        with:
+          image-ref: 'perfectcode:latest'
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+
+  deploy-workers:
+    name: "Deploy Cloudflare Workers"
+    runs-on: ubuntu-latest
+    needs: [validate-10kb, test-suite, security-scan]
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      
+      - name: Install dependencies
+        run: npm ci
+      
+      - name: Build Workers
+        run: npm run build:workers
+      
+      - name: Deploy to Cloudflare
+        run: |
+          # Deploy generator worker
+          npx wrangler deploy cloudflare-workers/perfect-worker.ts \
+            --name perfect-generator-v1 \
+            --compatibility-date 2024-01-01
+          
+          # Deploy error handler worker
+          npx wrangler deploy cloudflare-workers/error-handler.ts \
+            --name error-handler-v1 \
+            --compatibility-date 2024-01-01
+          
+          # Deploy optimizer worker
+          npx wrangler deploy cloudflare-workers/optimizer.ts \
+            --name optimizer-v1 \
+            --compatibility-date 2024-01-01
+      
+      - name: Update Traffic Routes
+        run: |
+          # Gradual traffic shift to new workers
+          npx wrangler route update \
+            --pattern "api.perfectcode.com/generate/*" \
+            --worker perfect-generator-v1 \
+            --weight 10
+          
+          sleep 30
+          
+          npx wrangler route update \
+            --pattern "api.perfectcode.com/generate/*" \
+            --worker perfect-generator-v1 \
+            --weight 100
+
+  deploy-microservices:
+    name: "Deploy Micro-Services"
+    runs-on: ubuntu-latest
+    needs: [validate-10kb, test-suite, security-scan]
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.28.0'
+      
+      - name: Build and Push Images
+        run: |
+          # Build micro-service images
+          docker build -t perfectcode/generator:${{ github.sha }} \
+            -f micro-services/Dockerfile.generator .
+          
+          docker build -t perfectcode/error-handler:${{ github.sha }} \
+            -f micro-services/Dockerfile.error-handler .
+          
+          # Push to registry
+          docker push perfectcode/generator:${{ github.sha }}
+          docker push perfectcode/error-handler:${{ github.sha }}
+      
+      - name: Deploy to Kubernetes
+        run: |
+          # Update deployment manifests
+          sed -i "s/IMAGE_TAG/${{ github.sha }}/g" deployment/k8s/*.yaml
+          
+          # Apply deployments
+          kubectl apply -f deployment/k8s/
+          
+          # Wait for rollout
+          kubectl rollout status deployment/generator-service
+          kubectl rollout status deployment/error-handler-service
+
+  deploy-blockchain:
+    name: "Deploy Smart Contracts"
+    runs-on: ubuntu-latest
+    needs: [validate-10kb, test-suite, security-scan]
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+      
+      - name: Install Hardhat
+        run: npm install --global hardhat
+      
+      - name: Compile Contracts
+        run: npx hardhat compile
+      
+      - name: Run Contract Tests
+        run: npx hardhat test
+      
+      - name: Deploy to Mainnet
+        run: |
+          npx hardhat run scripts/deploy-perfectcode-nft.ts \
+            --network mainnet
+        env:
+          PRIVATE_KEY: ${{ secrets.DEPLOYER_PRIVATE_KEY }}
+          ETHERSCAN_API_KEY: ${{ secrets.ETHERSCAN_API_KEY }}
+      
+      - name: Verify Contract
+        run: |
+          npx hardhat verify --network mainnet \
+            ${{ env.CONTRACT_ADDRESS }} \
+            "PerfectCode" "PCODE"
+
+  post-deployment:
+    name: "Post-Deployment Validation"
+    runs-on: ubuntu-latest
+    needs: [deploy-workers, deploy-microservices, deploy-blockchain]
+    steps:
+      - name: Health Check - Workers
+        run: |
+          curl -f https://api.perfectcode.com/health || exit 1
+      
+      - name: Health Check - Micro-Services
+        run: |
+          curl -f https://services.perfectcode.com/health || exit 1
+      
+      - name: Performance Test
+        run: |
+          # Run performance tests against production
+          npm run test:performance:production
+      
+      - name: Monitor Deployment
+        run: |
+          # Start monitoring for 5 minutes
+          timeout 300 npm run monitor:deployment
+```
